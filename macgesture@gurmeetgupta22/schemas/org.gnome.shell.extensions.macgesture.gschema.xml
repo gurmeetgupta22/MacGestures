@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.macgesture"
+          path="/org/gnome/shell/extensions/macgesture/">
+
+    <key name="finger-count" type="i">
+      <default>3</default>
+      <range min="3" max="4"/>
+      <summary>Gesture finger count</summary>
+      <description>Number of fingers required for the app-switch swipe. Use 4 to leave native 3-finger workspace switching untouched.</description>
+    </key>
+
+    <key name="invert-direction" type="b">
+      <default>false</default>
+      <summary>Invert swipe direction</summary>
+      <description>Flip next/previous after applying the system natural-scroll setting.</description>
+    </key>
+
+    <key name="swipe-threshold" type="d">
+      <default>0.4</default>
+      <range min="0.15" max="0.85"/>
+      <summary>Swipe distance threshold</summary>
+      <description>Fraction of a full swipe required to commit the switch when velocity is low. Lower values are more sensitive.</description>
+    </key>
+
+    <key name="animation-style" type="s">
+      <default>"live"</default>
+      <choices>
+        <choice value="live"/>
+        <choice value="simple"/>
+      </choices>
+      <summary>Animation style</summary>
+      <description>Live follows the fingers with window clones. Simple switches only when the gesture ends.</description>
+    </key>
+
+    <key name="animation-duration" type="i">
+      <default>250</default>
+      <range min="100" max="500"/>
+      <summary>Animation duration</summary>
+      <description>Duration in milliseconds for the finish (commit or snap-back) animation.</description>
+    </key>
+
+    <key name="all-workspaces" type="b">
+      <default>false</default>
+      <summary>Include apps from all workspaces</summary>
+      <description>If false, only applications with windows on the current workspace are included.</description>
+    </key>
+
+    <key name="ignore-fullscreen" type="b">
+      <default>false</default>
+      <summary>Ignore gestures in fullscreen apps</summary>
+      <description>Do not start an app-switch gesture while a fullscreen window is focused.</description>
+    </key>
+  </schema>
+</schemalist>

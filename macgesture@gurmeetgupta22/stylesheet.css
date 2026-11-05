@@ -1,0 +1,11 @@
+/* Overlay that covers one monitor while a live swipe is in progress.
+ * Opaque so the real window actors (left in place; see appSwitcher.js)
+ * are not visible underneath the sliding clones. */
+.macgesture-cover {
+    background-color: #1c1c1c;
+}
+
+.macgesture-placeholder {
+    background-color: rgba(40, 40, 40, 0.95);
+    border-radius: 12px;
+}
