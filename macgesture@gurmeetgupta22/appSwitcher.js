@@ -1,23 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// MRU application list, activation, and live window-slide overlay.
+// Application cycle, activation, and live window-slide overlay.
 //
-// App order mirrors js/ui/altTab.js:
-//   getWindows(workspace) uses display.get_tab_list(Meta.TabList.NORMAL_ALL, workspace)
-//   then unique-by-app via Shell.WindowTracker.get_window_app().
-// We switch *applications* (one entry per app, focusing that app's MRU window),
-// not individual windows of the same app.
+// App order mirrors js/ui/altTab.js AppSwitcherPopup:
+//   Shell.AppSystem.get_running() (sorted by shell_app_compare / last user time)
+//   then getWindows(workspace) via display.get_tab_list(Meta.TabList.NORMAL_ALL).
 //
-// Live overlay mirrors js/ui/workspaceAnimation.js WorkspaceGroup:
-//   Clutter.Clone of Meta.WindowActor, container inserted above global.window_group
-//   with Layout.MonitorConstraint. We do **not** hide the real actors: Clutter.Clone
-//   paints its source live, so hiding the source blanks the clone. Instead an opaque
-//   cover hides the stationary real windows while clones slide.
+// Cycling mirrors holding Super+Tab: the list is frozen while you keep swiping
+// so both directions walk every app. Rebuilding MRU after each switch made one
+// direction toggle between two apps. After CYCLE_HOLD_MS with no swipe, rebuild.
 //
-// If this breaks: check Meta.TabList, WindowTracker.get_window_app, Main.activateWindow,
-// global.get_window_actors(), and Layout.MonitorConstraint in ui/layout.js.
+// Live overlay mirrors js/ui/workspaceAnimation.js WorkspaceGroup.
 
 import Clutter from 'gi://Clutter';
+import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
 import Mtk from 'gi://Mtk';
@@ -26,6 +22,10 @@ import St from 'gi://St';
 
 import * as Layout from 'resource:///org/gnome/shell/ui/layout.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+
+// Super+Tab keeps its order until Alt/Super is released. We keep ours for a
+// short idle so successive swipes continue through the same cycle.
+const CYCLE_HOLD_MS = 2000;
 
 const SwitchOverlay = GObject.registerClass(
 class MacGestureSwitchOverlay extends St.Widget {
@@ -116,8 +116,11 @@ export class AppSwitcher {
         this._busy = false;
         this._fromWindow = null;
         this._toWindow = null;
-        this._prevWindow = null;
-        this._nextWindow = null;
+        this._forwardWindow = null;
+        this._backWindow = null;
+        this._cycle = null;
+        this._cycleIndex = 0;
+        this._cycleTimeoutId = 0;
         this._monitorIndex = 0;
         this._monitorWidth = 0;
         this._live = true;
@@ -154,18 +157,15 @@ export class AppSwitcher {
             focus && focus.is_fullscreen())
             return false;
 
-        const apps = this._listApps();
-        return apps.length >= 2;
+        return this._cycleLength() >= 2 || this._listApps().length >= 2;
     }
 
     begin() {
-        const apps = this._listApps();
-        if (apps.length < 2)
+        this._clearCycleTimeout();
+        if (!this._ensureCycle())
             return false;
 
-        this._nextWindow = apps[1].window;
-        this._prevWindow = apps[apps.length - 1].window;
-        this._fromWindow = apps[0].window;
+        this._bindCycleWindows();
         this._toWindow = null;
         this._progress = 0;
         this._busy = true;
@@ -203,23 +203,21 @@ export class AppSwitcher {
         if (!this._busy)
             return;
 
-        const commit = endProgress !== 0;
-        this._toWindow = endProgress > 0
-            ? this._nextWindow
-            : endProgress < 0
-                ? this._prevWindow
-                : null;
+        const step = endProgress < 0 ? 1 : endProgress > 0 ? -1 : 0;
+        const commit = step !== 0;
+        if (commit)
+            this._toWindow = step > 0 ? this._forwardWindow : this._backWindow;
 
         if (!this._live || !this._overlay) {
             if (commit)
-                this._activate(this._toWindow);
+                this._commitCycle(step);
             this._cleanupSwitch();
             return;
         }
 
         const finish = () => {
             if (commit)
-                this._activate(this._toWindow);
+                this._commitCycle(step);
             this._cleanupSwitch();
         };
 
@@ -246,6 +244,8 @@ export class AppSwitcher {
 
     destroy() {
         this.cancel();
+        this._clearCycleTimeout();
+        this._cycle = null;
         this._settings = null;
         this._tracker = null;
     }
@@ -255,9 +255,99 @@ export class AppSwitcher {
         this._busy = false;
         this._fromWindow = null;
         this._toWindow = null;
-        this._prevWindow = null;
-        this._nextWindow = null;
+        this._forwardWindow = null;
+        this._backWindow = null;
         this._progress = 0;
+        this._armCycleTimeout();
+    }
+
+    _cycleLength() {
+        return this._cycle?.length ?? 0;
+    }
+
+    _ensureCycle() {
+        if (this._refreshCycle())
+            return true;
+
+        const apps = this._listApps();
+        if (apps.length < 2)
+            return false;
+
+        this._cycle = apps;
+        this._cycleIndex = 0;
+
+        const focus = global.display.focus_window;
+        if (focus) {
+            const focusApp = this._tracker.get_window_app(focus);
+            const idx = apps.findIndex(entry =>
+                entry.window === focus ||
+                (focusApp && entry.app.get_id() === focusApp.get_id()));
+            if (idx >= 0)
+                this._cycleIndex = idx;
+        }
+
+        return true;
+    }
+
+    _refreshCycle() {
+        if (!this._cycle || this._cycle.length < 2)
+            return false;
+
+        const live = this._listApps();
+        const byId = new Map(live.map(entry => [entry.app.get_id(), entry]));
+        const kept = [];
+        for (const entry of this._cycle) {
+            const fresh = byId.get(entry.app.get_id());
+            if (fresh)
+                kept.push(fresh);
+        }
+
+        if (kept.length < 2) {
+            this._cycle = null;
+            this._cycleIndex = 0;
+            return false;
+        }
+
+        const currentId = this._cycle[this._cycleIndex]?.app.get_id();
+        this._cycle = kept;
+        const idx = kept.findIndex(entry => entry.app.get_id() === currentId);
+        this._cycleIndex = idx >= 0 ? idx : 0;
+        return true;
+    }
+
+    _bindCycleWindows() {
+        const n = this._cycle.length;
+        const i = this._cycleIndex;
+        this._fromWindow = this._cycle[i].window;
+        this._forwardWindow = this._cycle[(i + 1) % n].window;
+        this._backWindow = this._cycle[(i - 1 + n) % n].window;
+    }
+
+    _commitCycle(step) {
+        const n = this._cycleLength();
+        if (n < 2 || step === 0)
+            return;
+
+        this._cycleIndex = (this._cycleIndex + step + n) % n;
+        this._activate(this._cycle[this._cycleIndex].window);
+    }
+
+    _armCycleTimeout() {
+        this._clearCycleTimeout();
+        this._cycleTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, CYCLE_HOLD_MS, () => {
+            this._cycleTimeoutId = 0;
+            this._cycle = null;
+            this._cycleIndex = 0;
+            return GLib.SOURCE_REMOVE;
+        });
+        GLib.Source.set_name_by_id(this._cycleTimeoutId, '[MacGesture] cycle hold');
+    }
+
+    _clearCycleTimeout() {
+        if (this._cycleTimeoutId) {
+            GLib.source_remove(this._cycleTimeoutId);
+            this._cycleTimeoutId = 0;
+        }
     }
 
     _pickMonitorIndex() {
@@ -286,32 +376,25 @@ export class AppSwitcher {
             .map(w => w.is_attached_dialog() ? w.get_transient_for() : w)
             .filter((w, i, a) => w && !w.skip_taskbar && a.indexOf(w) === i);
 
+        // js/ui/altTab.js AppSwitcherPopup: get_running() is already sorted by
+        // shell_app_compare() (last user interaction). Do not unique-by-window
+        // tab list — that follows window stacking (Claude tiled beside VS Code
+        // can outrank Chrome) instead of Super+Tab application order.
+        const running = Shell.AppSystem.get_default().get_running();
         const monitorIndex = this._pickMonitorIndex();
-        const seen = new Set();
         const apps = [];
 
-        for (const window of windows) {
-            const app = this._tracker.get_window_app(window);
-            if (!app)
+        for (const app of running) {
+            const appWindows = windows.filter(
+                w => this._tracker.get_window_app(w) === app);
+            if (appWindows.length === 0)
                 continue;
 
-            const id = app.get_id();
-            if (seen.has(id))
-                continue;
+            let chosen = appWindows[0];
+            const onMonitor = appWindows.find(w => w.get_monitor() === monitorIndex);
+            if (onMonitor)
+                chosen = onMonitor;
 
-            // Default scope is current workspace (already applied via tab list).
-            // Multi-monitor: prefer the window on the pointer's monitor when the
-            // app has one; otherwise keep the MRU window.
-            let chosen = window;
-            if (window.get_monitor() !== monitorIndex) {
-                const onMonitor = windows.find(w =>
-                    this._tracker.get_window_app(w) === app &&
-                    w.get_monitor() === monitorIndex);
-                if (onMonitor)
-                    chosen = onMonitor;
-            }
-
-            seen.add(id);
             apps.push({app, window: chosen});
         }
 
@@ -325,9 +408,11 @@ export class AppSwitcher {
         this._overlay = overlay;
 
         const width = this._monitorWidth;
-        overlay.addPane(this._makeVisual(this._prevWindow), -width);
+        // Next in Alt+Tab order comes from the left so a right swipe (natural
+        // scrolling: content follows fingers) lands on the previously used app.
+        overlay.addPane(this._makeVisual(this._forwardWindow), -width);
         overlay.addPane(this._makeVisual(this._fromWindow), 0);
-        overlay.addPane(this._makeVisual(this._nextWindow), width);
+        overlay.addPane(this._makeVisual(this._backWindow), width);
 
         // js/ui/workspaceAnimation.js MonitorGroup: insert above window_group
         // so clones cover real windows without restacking the compositor list.

@@ -1,6 +1,6 @@
 {
     "uuid": "macgesture@gurmeetgupta22",
-    "version": 1.28,
+    "version": 2,
     "name": "MacGesture",
     "description": "Switch between running applications with a live 3-finger (or 4-finger) horizontal touchpad swipe, similar to GNOME's native workspace gesture.\n\nWhen set to 3 fingers, this extension intercepts the native 3-finger horizontal workspace swipe and restores it when disabled. Vertical 3-finger swipe (Overview) is left unchanged.",
     "shell-version": ["49", "50"],
