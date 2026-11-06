@@ -1,8 +1,8 @@
 {
     "uuid": "macgesture@gurmeetgupta22",
-    "version": 2,
+    "version": 3,
     "name": "MacGesture",
-    "description": "Switch between running applications with a live 3-finger (or 4-finger) horizontal touchpad swipe, similar to GNOME's native workspace gesture.\n\nWhen set to 3 fingers, this extension intercepts the native 3-finger horizontal workspace swipe and restores it when disabled. Vertical 3-finger swipe (Overview) is left unchanged.",
+    "description": "Mac-style touchpad gestures for GNOME Shell on Wayland.\n\n• 3-finger horizontal swipe — live app switcher (windows slide with your fingers)\n• 3-finger vertical swipe — configurable: Overview, volume, brightness, maximize/minimize, close, show desktop, or custom keybind\n• 4-finger swipe — workspace switching, volume, brightness, media, Alt+Tab, or custom keybind\n• 3/4-finger tap — configurable action\n\nAll gestures are fully configurable in Settings → MacGesture.",
     "shell-version": ["49", "50"],
     "url": "https://github.com/gurmeetgupta22/MacGesture",
     "settings-schema": "org.gnome.shell.extensions.macgesture",

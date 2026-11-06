@@ -3,16 +3,20 @@
   <schema id="org.gnome.shell.extensions.macgesture"
           path="/org/gnome/shell/extensions/macgesture/">
 
+    <!-- ══════════════════════════════════════════════════════════════════
+         APP SWITCHER (3-finger horizontal swipe — the MacGesture core)
+         ══════════════════════════════════════════════════════════════════ -->
+
     <key name="finger-count" type="i">
       <default>3</default>
       <range min="3" max="4"/>
-      <summary>Gesture finger count</summary>
-      <description>Number of fingers required for the app-switch swipe. Use 4 to leave native 3-finger workspace switching untouched.</description>
+      <summary>App-switch gesture finger count</summary>
+      <description>Number of fingers for the live app-switch horizontal swipe. 3 intercepts the native workspace swipe; 4 leaves it untouched.</description>
     </key>
 
     <key name="invert-direction" type="b">
       <default>false</default>
-      <summary>Invert swipe direction</summary>
+      <summary>Invert app-switch swipe direction</summary>
       <description>Flip next/previous after applying the system natural-scroll setting.</description>
     </key>
 
@@ -20,7 +24,7 @@
       <default>0.4</default>
       <range min="0.15" max="0.85"/>
       <summary>Swipe distance threshold</summary>
-      <description>Fraction of a full swipe required to commit the switch when velocity is low. Lower values are more sensitive.</description>
+      <description>Fraction of a full swipe required to commit the switch when velocity is low.</description>
     </key>
 
     <key name="animation-style" type="s">
@@ -30,14 +34,14 @@
         <choice value="simple"/>
       </choices>
       <summary>Animation style</summary>
-      <description>Live follows the fingers with window clones. Simple switches only when the gesture ends.</description>
+      <description>Live follows fingers with window clones. Simple switches only when the gesture ends.</description>
     </key>
 
     <key name="animation-duration" type="i">
       <default>250</default>
       <range min="100" max="500"/>
-      <summary>Animation duration</summary>
-      <description>Duration in milliseconds for the finish (commit or snap-back) animation.</description>
+      <summary>Animation duration (ms)</summary>
+      <description>Duration in milliseconds for the commit or snap-back animation.</description>
     </key>
 
     <key name="all-workspaces" type="b">
@@ -51,5 +55,120 @@
       <summary>Ignore gestures in fullscreen apps</summary>
       <description>Do not start an app-switch gesture while a fullscreen window is focused.</description>
     </key>
+
+    <!-- ══════════════════════════════════════════════════════════════════
+         3-FINGER GESTURES  (vertical + tap — action index constants)
+         ══════════════════════════════════════════════════════════════════
+         Vertical action indices (V.*):
+           0=Activities  1=Volume  2=Brightness  3=Maximize/Minimize
+           4=Close       5=ShowDesktop  6=CustomKeybind  7=Disabled
+
+         Tap action indices (T.*):
+           0=PlayPause  1=ShowDesktop  2=CycleWorkspaces
+           3=Notifications  4=CustomKeybind  5=Disabled
+         ══════════════════════════════════════════════════════════════════ -->
+
+    <key name="three-swipe-up-action" type="i">
+      <default>0</default>
+      <range min="0" max="7"/>
+      <summary>3-finger swipe-up action</summary>
+      <description>Action index for 3-finger swipe up. 0=Activities 1=Volume 2=Brightness 3=Maximize/Min 4=Close 5=ShowDesktop 6=Custom 7=Disabled</description>
+    </key>
+
+    <key name="three-swipe-down-action" type="i">
+      <default>7</default>
+      <range min="0" max="7"/>
+      <summary>3-finger swipe-down action</summary>
+      <description>Action index for 3-finger swipe down.</description>
+    </key>
+
+    <key name="three-tap-action" type="i">
+      <default>5</default>
+      <range min="0" max="5"/>
+      <summary>3-finger tap action</summary>
+      <description>Action index for 3-finger tap. 0=PlayPause 1=ShowDesktop 2=CycleWS 3=Notifications 4=Custom 5=Disabled</description>
+    </key>
+
+    <key name="three-swipe-up-keybind" type="s">
+      <default>''</default>
+      <summary>3-finger swipe-up custom keybind</summary>
+      <description>Format: "KEYVAL:MODMASK" decimal integers. Empty = none.</description>
+    </key>
+
+    <key name="three-swipe-down-keybind" type="s">
+      <default>''</default>
+      <summary>3-finger swipe-down custom keybind</summary>
+    </key>
+
+    <key name="three-tap-keybind" type="s">
+      <default>''</default>
+      <summary>3-finger tap custom keybind</summary>
+    </key>
+
+    <!-- ══════════════════════════════════════════════════════════════════
+         4-FINGER GESTURES  (all directions + tap)
+         ══════════════════════════════════════════════════════════════════
+         Left/Right action indices (H.*):
+           0=WorkspaceLeft/Right  1=BrightnessDown/Up  2=AltTabPrev/Next
+           3=MediaPrev/Next  4=CustomKeybind  5=Disabled
+         ══════════════════════════════════════════════════════════════════ -->
+
+    <key name="four-swipe-up-action" type="i">
+      <default>7</default>
+      <range min="0" max="7"/>
+      <summary>4-finger swipe-up action</summary>
+    </key>
+
+    <key name="four-swipe-down-action" type="i">
+      <default>7</default>
+      <range min="0" max="7"/>
+      <summary>4-finger swipe-down action</summary>
+    </key>
+
+    <key name="four-swipe-left-action" type="i">
+      <default>5</default>
+      <range min="0" max="5"/>
+      <summary>4-finger swipe-left action</summary>
+      <description>0=WSLeft 1=BrightnessDown 2=AltTabPrev 3=MediaPrev 4=Custom 5=Disabled</description>
+    </key>
+
+    <key name="four-swipe-right-action" type="i">
+      <default>5</default>
+      <range min="0" max="5"/>
+      <summary>4-finger swipe-right action</summary>
+      <description>0=WSRight 1=BrightnessUp 2=AltTabNext 3=MediaNext 4=Custom 5=Disabled</description>
+    </key>
+
+    <key name="four-tap-action" type="i">
+      <default>5</default>
+      <range min="0" max="5"/>
+      <summary>4-finger tap action</summary>
+    </key>
+
+    <key name="four-swipe-up-keybind" type="s">
+      <default>''</default>
+      <summary>4-finger swipe-up custom keybind</summary>
+    </key>
+
+    <key name="four-swipe-down-keybind" type="s">
+      <default>''</default>
+      <summary>4-finger swipe-down custom keybind</summary>
+    </key>
+
+    <key name="four-swipe-left-keybind" type="s">
+      <default>''</default>
+      <summary>4-finger swipe-left custom keybind</summary>
+    </key>
+
+    <key name="four-swipe-right-keybind" type="s">
+      <default>''</default>
+      <summary>4-finger swipe-right custom keybind</summary>
+    </key>
+
+    <key name="four-tap-keybind" type="s">
+      <default>''</default>
+      <summary>4-finger tap custom keybind</summary>
+    </key>
+
   </schema>
 </schemalist>
