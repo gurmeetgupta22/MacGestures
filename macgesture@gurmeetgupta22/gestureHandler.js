@@ -796,8 +796,6 @@ export class GestureHandler {
             if (phase === Clutter.TouchpadGesturePhase.UPDATE) {
                 this._cumulativeX += dx;
                 this._cumulativeY += dy;
-                if (this._other)
-                    this._other.handleSwipe(event, n);
 
                 const dist = Math.hypot(this._cumulativeX, this._cumulativeY);
                 if (dist >= DRAG_THRESHOLD_DISTANCE) {
@@ -806,32 +804,37 @@ export class GestureHandler {
                     this._cumulativeY = 0;
 
                     if (isHoriz && this._callbacks.canBegin()) {
-                        // → app-switch horizontal path
+                        // → confirmed horizontal: app-switch path
+                        // OtherGestureHandler's buffered state is no longer needed
+                        if (this._other)
+                            this._other.reset();
                         this._appSwitchState = AppSwitchState.HANDLING;
                         this._progress = 0;
                         this._history.reset();
                         this._history.append(time, 0);
-
-                        if (this._other)
-                            this._other.reset();
-
-                        if (!this._callbacks.onBegin()) {
+                        if (!this._callbacks.onBegin())
                             this._appSwitchState = AppSwitchState.IGNORED;
-                        }
                     } else {
-                        // → vertical / not allowed: hand off to OtherGestureHandler
+                        // → confirmed vertical / other: hand off to OtherGestureHandler
                         this._appSwitchState = AppSwitchState.IGNORED;
+                        // OtherGestureHandler already has BEGIN; now send this UPDATE
+                        if (this._other)
+                            this._other.handleSwipe(event, n);
                     }
                 }
+                // While still PENDING, don't forward to OtherGestureHandler —
+                // it would try to look up three-swipe-left/right schema keys
+                // that don't exist (horizontal is owned by the app-switcher).
                 return Clutter.EVENT_STOP;
             }
 
             if (phase === Clutter.TouchpadGesturePhase.END ||
                 phase === Clutter.TouchpadGesturePhase.CANCEL) {
+                // Direction never resolved — reset both state machines cleanly
+                if (this._other)
+                    this._other.reset();
                 this._resetAppSwitch();
-                return this._other
-                    ? this._other.handleSwipe(event, n)
-                    : Clutter.EVENT_STOP;
+                return Clutter.EVENT_STOP;
             }
         }
 
