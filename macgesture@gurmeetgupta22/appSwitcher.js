@@ -278,10 +278,7 @@ export class AppSwitcher {
 
         const focus = global.display.focus_window;
         if (focus) {
-            const focusApp = this._tracker.get_window_app(focus);
-            const idx = apps.findIndex(entry =>
-                entry.window === focus ||
-                (focusApp && entry.app.get_id() === focusApp.get_id()));
+            const idx = apps.findIndex(entry => entry.window === focus);
             if (idx >= 0)
                 this._cycleIndex = idx;
         }
@@ -294,10 +291,11 @@ export class AppSwitcher {
             return false;
 
         const live = this._listApps();
-        const byId = new Map(live.map(entry => [entry.app.get_id(), entry]));
+        // Key refresh by window identity so each window stays a separate slot
+        const byWindow = new Map(live.map(entry => [entry.window, entry]));
         const kept = [];
         for (const entry of this._cycle) {
-            const fresh = byId.get(entry.app.get_id());
+            const fresh = byWindow.get(entry.window);
             if (fresh)
                 kept.push(fresh);
         }
@@ -308,9 +306,9 @@ export class AppSwitcher {
             return false;
         }
 
-        const currentId = this._cycle[this._cycleIndex]?.app.get_id();
+        const currentWindow = this._cycle[this._cycleIndex]?.window;
         this._cycle = kept;
-        const idx = kept.findIndex(entry => entry.app.get_id() === currentId);
+        const idx = kept.findIndex(entry => entry.window === currentWindow);
         this._cycleIndex = idx >= 0 ? idx : 0;
         return true;
     }
@@ -365,6 +363,8 @@ export class AppSwitcher {
 
     /**
      * @returns {{app: Shell.App, window: Meta.Window}[]}
+     * One entry per WINDOW (not per app), in MRU order.
+     * Multiple windows of the same app appear as separate cycle entries.
      */
     _listApps() {
         const workspace = this._settings.get_boolean('all-workspaces')
@@ -376,29 +376,12 @@ export class AppSwitcher {
             .map(w => w.is_attached_dialog() ? w.get_transient_for() : w)
             .filter((w, i, a) => w && !w.skip_taskbar && a.indexOf(w) === i);
 
-        // js/ui/altTab.js AppSwitcherPopup: get_running() is already sorted by
-        // shell_app_compare() (last user interaction). Do not unique-by-window
-        // tab list — that follows window stacking (Claude tiled beside VS Code
-        // can outrank Chrome) instead of Super+Tab application order.
-        const running = Shell.AppSystem.get_default().get_running();
-        const monitorIndex = this._pickMonitorIndex();
-        const apps = [];
-
-        for (const app of running) {
-            const appWindows = windows.filter(
-                w => this._tracker.get_window_app(w) === app);
-            if (appWindows.length === 0)
-                continue;
-
-            let chosen = appWindows[0];
-            const onMonitor = appWindows.find(w => w.get_monitor() === monitorIndex);
-            if (onMonitor)
-                chosen = onMonitor;
-
-            apps.push({app, window: chosen});
-        }
-
-        return apps;
+        // Build one entry per window, keeping MRU order from get_tab_list.
+        // This allows multiple windows of the same app to be cycled individually.
+        return windows.map(w => ({
+            app: this._tracker.get_window_app(w),
+            window: w,
+        })).filter(entry => entry.app !== null);
     }
 
     _createOverlay() {
