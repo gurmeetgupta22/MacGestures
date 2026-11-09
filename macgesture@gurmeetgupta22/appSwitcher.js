@@ -35,7 +35,6 @@ class MacGestureSwitchOverlay extends St.Widget {
         super._init({
             style_class: 'macgesture-switch-overlay',
             clip_to_allocation: true,
-            layout_manager: new Clutter.BinLayout(),
             x: monitor.x,
             y: monitor.y,
             width: monitor.width,
@@ -48,55 +47,6 @@ class MacGestureSwitchOverlay extends St.Widget {
 
         this.add_constraint(new Layout.MonitorConstraint({index: monitorIndex}));
 
-        // Render actual desktop wallpaper underneath so non-fullscreen windows
-        // slide across wallpaper without an abrupt dark void.
-        // We clone the existing desktop background directly instead of creating
-        // a new BackgroundManager. This avoids reloading wallpapers, triggering
-        // 1-second fade-in transitions, or conflicting with live wallpaper extensions
-        // (such as LiveEngine or Hanabi) which inject their live renderers into _backgroundGroup.
-        this._bgClone = null;
-        try {
-            const backgroundGroup = Main.layoutManager._backgroundGroup;
-            if (backgroundGroup) {
-                this._bgClone = new Clutter.Clone({
-                    source: backgroundGroup,
-                    x: -monitor.x,
-                    y: -monitor.y,
-                });
-                this.add_child(this._bgClone);
-            }
-        } catch (e) {
-            console.error('[MacGesture] failed to clone backgroundGroup:', e);
-        }
-
-        // Fallback: try monitor background actor if backgroundGroup wasn't cloneable
-        if (!this._bgClone) {
-            try {
-                const bgActor = Main.layoutManager._bgManagers?.[monitorIndex]?.backgroundActor;
-                if (bgActor) {
-                    this._bgClone = new Clutter.Clone({
-                        source: bgActor,
-                        x: 0,
-                        y: 0,
-                    });
-                    this.add_child(this._bgClone);
-                }
-            } catch (e) {
-                console.error('[MacGesture] failed to clone monitor background actor:', e);
-            }
-        }
-
-        if (!this._bgClone) {
-            this._cover = new St.Widget({
-                style_class: 'macgesture-cover',
-                x_expand: true,
-                y_expand: true,
-                x_align: Clutter.ActorAlign.FILL,
-                y_align: Clutter.ActorAlign.FILL,
-            });
-            this.add_child(this._cover);
-        }
-
         this._slider = new Clutter.Actor({
             x: 0,
             y: 0,
@@ -106,33 +56,19 @@ class MacGestureSwitchOverlay extends St.Widget {
         this.add_child(this._slider);
     }
 
-    destroy() {
-        if (this._bgClone) {
-            this._bgClone.destroy();
-            this._bgClone = null;
-        }
-        super.destroy();
-    }
-
     /**
-     * @param {{actor: Clutter.Actor, x: number, y: number}|null} visual
+     * Insert a full-monitor pane. Wallpaper lives *inside* each pane so
+     * windowed apps slide as a complete desktop, like WorkspaceGroup in
+     * js/ui/workspaceAnimation.js — not as a floating clone over a static bg.
+     *
+     * @param {Clutter.Actor} pane
      * @param {number} offsetX
      */
-    addPane(visual, offsetX) {
-        const monitor = this._monitor;
-        const pane = new Clutter.Actor({
-            x: offsetX,
-            y: 0,
-            width: monitor.width,
-            height: monitor.height,
-        });
-
-        if (visual) {
-            visual.actor.x = visual.x;
-            visual.actor.y = visual.y;
-            pane.add_child(visual.actor);
-        }
-
+    addPane(pane, offsetX) {
+        pane.x = offsetX;
+        pane.y = 0;
+        pane.width = this._monitor.width;
+        pane.height = this._monitor.height;
         this._slider.add_child(pane);
         this._records.push(pane);
         return pane;
@@ -179,6 +115,9 @@ export class AppSwitcher {
         this._cycleTimeoutId = 0;
         this._finishLaterId = 0;
         this._finishIdleId = 0;
+        this._finishWatchdogId = 0;
+        this._finishGeneration = 0;
+        this._pendingStep = 0;
         this._monitorIndex = 0;
         this._monitorWidth = 0;
         this._live = true;
@@ -194,8 +133,9 @@ export class AppSwitcher {
      * touchpad capture path.
      */
     canBegin() {
-        if (this._busy)
-            return false;
+        // Do not reject while _busy: a fast follow-up swipe must interrupt
+        // the settle animation (same as js/ui/workspaceAnimation.js, which
+        // stops the in-progress ease and continues the gesture).
 
         if (Main.overview.visible)
             return false;
@@ -219,6 +159,7 @@ export class AppSwitcher {
     }
 
     begin() {
+        this._interrupt();
         this._clearCycleTimeout();
         if (!this._ensureCycle())
             return false;
@@ -263,52 +204,42 @@ export class AppSwitcher {
 
         const step = endProgress < 0 ? 1 : endProgress > 0 ? -1 : 0;
         const commit = step !== 0;
+        this._pendingStep = step;
         if (commit)
             this._toWindow = step > 0 ? this._forwardWindow : this._backWindow;
 
         if (!this._live || !this._overlay) {
             if (commit)
                 this._commitCycle(step);
+            this._pendingStep = 0;
             this._cleanupSwitch();
             return;
         }
 
+        const generation = this._finishGeneration;
         const finish = () => {
+            if (generation !== this._finishGeneration)
+                return;
+
             if (commit) {
                 this._commitCycle(step);
-                // Keep the target window clone visible at 100% opacity until Mutter
-                // completes restacking (SYNC_STACK) and prepares to draw the real window.
-                // We NEVER fade out the overlay's opacity: fading makes the window clone
-                // translucent and exposes the wallpaper underneath.
-                // Mutter processes SYNC_STACK before BEFORE_REDRAW, so destroying the overlay
-                // in BEFORE_REDRAW guarantees the real window is already raised on the
-                // exact frame the overlay disappears.
-                try {
-                    const laters = global.compositor?.get_laters?.();
-                    if (laters) {
-                        this._finishLaterId = laters.add(Meta.LaterType.BEFORE_REDRAW, () => {
-                            this._finishLaterId = 0;
-                            this._cleanupSwitch();
-                            return GLib.SOURCE_REMOVE;
-                        });
-                        return;
-                    }
-                } catch (e) {
-                    console.error('[MacGesture] laters.add failed:', e);
-                }
-
-                this._finishIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-                    this._finishIdleId = 0;
-                    this._cleanupSwitch();
-                    return GLib.SOURCE_REMOVE;
-                });
+                this._pendingStep = 0;
+                this._scheduleOverlayRemoval(generation);
                 return;
             }
+            this._pendingStep = 0;
             this._cleanupSwitch();
         };
 
+        // Zero-duration / already-there: Clutter.ease may never emit onComplete.
+        if (!duration || duration < 16) {
+            finish();
+            return;
+        }
+
         try {
             this._overlay.easeTo(endProgress, this._monitorWidth, duration, finish);
+            this._armFinishWatchdog(generation, duration);
         } catch (e) {
             console.error('[MacGesture] overlay ease failed:', e);
             finish();
@@ -319,6 +250,8 @@ export class AppSwitcher {
         if (!this._busy)
             return;
 
+        this._finishGeneration++;
+        this._pendingStep = 0;
         try {
             this._overlay?.stopEase();
         } catch (e) {
@@ -329,25 +262,117 @@ export class AppSwitcher {
     }
 
     destroy() {
+        this._finishGeneration++;
+        this._pendingStep = 0;
         this.cancel();
+        this._clearFinishSources();
         this._clearCycleTimeout();
         this._cycle = null;
         this._settings = null;
         this._tracker = null;
     }
 
-    _cleanupSwitch() {
+    /**
+     * Abort an in-flight settle so a new swipe can start immediately.
+     * Any committed-but-not-yet-shown target is activated first so the
+     * frozen cycle index stays in sync.
+     */
+    _interrupt() {
+        this._finishGeneration++;
+        this._clearFinishSources();
+
+        try {
+            this._overlay?.stopEase();
+        } catch (e) {
+            console.error('[MacGesture] overlay interrupt failed:', e);
+        }
+
+        if (this._pendingStep) {
+            this._commitCycle(this._pendingStep);
+            this._pendingStep = 0;
+        }
+
+        this._destroyOverlay();
+        this._busy = false;
+        this._fromWindow = null;
+        this._toWindow = null;
+        this._forwardWindow = null;
+        this._backWindow = null;
+        this._progress = 0;
+    }
+
+    _scheduleOverlayRemoval(generation) {
+        const remove = () => {
+            if (generation !== this._finishGeneration)
+                return;
+            this._cleanupSwitch();
+        };
+
+        try {
+            const laters = global.compositor?.get_laters?.();
+            if (laters) {
+                this._finishLaterId = laters.add(Meta.LaterType.BEFORE_REDRAW, () => {
+                    this._finishLaterId = 0;
+                    remove();
+                    return GLib.SOURCE_REMOVE;
+                });
+            }
+        } catch (e) {
+            console.error('[MacGesture] laters.add failed:', e);
+        }
+
+        if (!this._finishLaterId) {
+            this._finishIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                this._finishIdleId = 0;
+                remove();
+                return GLib.SOURCE_REMOVE;
+            });
+        }
+
+        // BEFORE_REDRAW can be skipped under load (fast successive swipes).
+        this._armFinishWatchdog(generation, 80);
+    }
+
+    _armFinishWatchdog(generation, duration) {
+        this._clearFinishWatchdog();
+        const wait = Math.max(120, (duration || 0) + 80);
+        this._finishWatchdogId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, wait, () => {
+            this._finishWatchdogId = 0;
+            if (generation !== this._finishGeneration)
+                return GLib.SOURCE_REMOVE;
+            if (this._busy)
+                this._cleanupSwitch();
+            return GLib.SOURCE_REMOVE;
+        });
+        GLib.Source.set_name_by_id(this._finishWatchdogId, '[MacGesture] finish watchdog');
+    }
+
+    _clearFinishWatchdog() {
+        if (this._finishWatchdogId) {
+            GLib.source_remove(this._finishWatchdogId);
+            this._finishWatchdogId = 0;
+        }
+    }
+
+    _clearFinishSources() {
         if (this._finishLaterId) {
             try {
                 const laters = global.compositor?.get_laters?.();
                 laters?.remove(this._finishLaterId);
-            } catch {}
+            } catch {
+            }
             this._finishLaterId = 0;
         }
         if (this._finishIdleId) {
             GLib.source_remove(this._finishIdleId);
             this._finishIdleId = 0;
         }
+        this._clearFinishWatchdog();
+    }
+
+    _cleanupSwitch() {
+        this._clearFinishSources();
+        this._pendingStep = 0;
 
         this._destroyOverlay();
         this._busy = false;
@@ -404,17 +429,9 @@ export class AppSwitcher {
             return false;
         }
 
-        // If focus changed outside the gesture, align cycleIndex with the currently focused window
-        const focus = global.display.focus_window;
-        if (focus) {
-            const focusIdx = kept.findIndex(entry => entry.window === focus);
-            if (focusIdx >= 0) {
-                this._cycleIndex = focusIdx;
-                this._cycle = kept;
-                return true;
-            }
-        }
-
+        // Keep the frozen Super+Tab index. Do not snap back to focus_window:
+        // after a fast swipe, activate() has not always been applied yet, so
+        // realigning to focus would rewind the cycle and look "stuck".
         const currentWindow = this._cycle[this._cycleIndex]?.window;
         this._cycle = kept;
         const idx = kept.findIndex(entry => entry.window === currentWindow);
@@ -503,9 +520,9 @@ export class AppSwitcher {
         const width = this._monitorWidth;
         // Next in Alt+Tab order comes from the left so a right swipe (natural
         // scrolling: content follows fingers) lands on the previously used app.
-        overlay.addPane(this._makeVisual(this._forwardWindow), -width);
-        overlay.addPane(this._makeVisual(this._fromWindow), 0);
-        overlay.addPane(this._makeVisual(this._backWindow), width);
+        overlay.addPane(this._makePane(this._forwardWindow, false), -width);
+        overlay.addPane(this._makePane(this._fromWindow, true), 0);
+        overlay.addPane(this._makePane(this._backWindow, false), width);
 
         // js/ui/workspaceAnimation.js MonitorGroup: insert above window_group
         // so clones cover real windows without restacking the compositor list.
@@ -527,44 +544,254 @@ export class AppSwitcher {
     }
 
     /**
+     * Full-monitor slide card. Wallpaper is a child of the pane so windowed
+     * apps animate like GNOME workspace switches (the whole desktop moves),
+     * not as a tiny clone over a hole in a transparent layer.
+     *
      * @param {Meta.Window} window
-     * @returns {{actor: Clutter.Actor, x: number, y: number}|null}
+     * @param {boolean} snapshotMonitor  If true, clone every visible window on
+     *     this monitor (outgoing frame). If false, clone only this window and
+     *     its attached dialogs (incoming app).
+     * @returns {Clutter.Actor}
      */
-    _makeVisual(window) {
-        if (!window)
-            return null;
-
+    _makePane(window, snapshotMonitor) {
         const monitor = Main.layoutManager.monitors[this._monitorIndex] ?? Main.layoutManager.primaryMonitor;
-        const actor = window.get_compositor_private();
+        const pane = new Clutter.Actor({
+            width: monitor.width,
+            height: monitor.height,
+            clip_to_allocation: true,
+        });
 
-        if (actor && actor.width > 0 && actor.height > 0 && !window.minimized) {
-            try {
-                const clone = new Clutter.Clone({
-                    source: actor,
-                    width: actor.width,
-                    height: actor.height,
-                });
-                clone.connect('destroy', () => {
-                    // Source actor may already be gone; ignore.
-                });
-                actor.connectObject('destroy', () => {
-                    try {
-                        clone.destroy();
-                    } catch {
-                    }
-                }, clone);
+        const wallpaper = this._cloneWallpaper(monitor);
+        if (wallpaper)
+            pane.add_child(wallpaper);
+        else
+            pane.add_child(this._solidCover(monitor));
 
-                return {
-                    actor: clone,
-                    x: actor.x - monitor.x,
-                    y: actor.y - monitor.y,
-                };
-            } catch (e) {
-                console.error('[MacGesture] clone failed:', e);
+        if (snapshotMonitor)
+            this._addMonitorWindowClones(pane, monitor);
+        else if (window)
+            this._addWindowClones(pane, monitor, window);
+
+        return pane;
+    }
+
+    /**
+     * Clone the existing wallpaper actor (js/ui/layout.js _bgManagers /
+     * _backgroundGroup). Do not construct BackgroundManager — that retriggers
+     * fade-in and fights live-wallpaper extensions.
+     *
+     * @param {object} monitor
+     * @returns {Clutter.Actor|null}
+     */
+    _cloneWallpaper(monitor) {
+        try {
+            const bgActor = Main.layoutManager._bgManagers?.[this._monitorIndex]?.backgroundActor;
+            if (bgActor) {
+                const clone = new Clutter.Clone({source: bgActor});
+                const [x, y] = this._stagePos(bgActor);
+                clone.x = x - monitor.x;
+                clone.y = y - monitor.y;
+                return clone;
+            }
+        } catch (e) {
+            console.error('[MacGesture] monitor wallpaper clone failed:', e);
+        }
+
+        try {
+            const group = Main.layoutManager._backgroundGroup;
+            if (group) {
+                return new Clutter.Clone({
+                    source: group,
+                    x: -monitor.x,
+                    y: -monitor.y,
+                });
+            }
+        } catch (e) {
+            console.error('[MacGesture] backgroundGroup clone failed:', e);
+        }
+
+        return null;
+    }
+
+    _solidCover(monitor) {
+        return new St.Widget({
+            style_class: 'macgesture-cover',
+            width: monitor.width,
+            height: monitor.height,
+        });
+    }
+
+    /**
+     * Bottom-to-top stack of every window currently painted on this monitor.
+     * Mirrors WorkspaceGroup._createWindows() so the outgoing pane matches
+     * what the user sees.
+     *
+     * @param {Clutter.Actor} pane
+     * @param {object} monitor
+     */
+    _addMonitorWindowClones(pane, monitor) {
+        const actors = global.get_window_actors();
+        for (const actor of actors) {
+            const metaWindow = actor.meta_window;
+            if (!this._shouldCloneWindow(metaWindow, monitor))
+                continue;
+            if (!metaWindow.showing_on_its_workspace())
+                continue;
+            this._attachClone(pane, monitor, actor, metaWindow);
+        }
+    }
+
+    /**
+     * Incoming pane: the destination window plus attached dialogs, in stack
+     * order, so a windowed app sits on wallpaper at its real frame.
+     *
+     * @param {Clutter.Actor} pane
+     * @param {object} monitor
+     * @param {Meta.Window} window
+     */
+    _addWindowClones(pane, monitor, window) {
+        const wanted = new Set([window]);
+        for (const actor of global.get_window_actors()) {
+            const other = actor.meta_window;
+            if (!other)
+                continue;
+            let parent = other.get_transient_for();
+            let hops = 0;
+            while (parent && hops++ < 8) {
+                if (parent === window) {
+                    wanted.add(other);
+                    break;
+                }
+                parent = parent.get_transient_for();
             }
         }
 
-        // Minimized / missing actor: show an elegant window placeholder card
+        const actors = global.get_window_actors();
+        let cloned = false;
+        for (const actor of actors) {
+            const metaWindow = actor.meta_window;
+            if (!wanted.has(metaWindow))
+                continue;
+            if (!this._windowIntersectsMonitor(metaWindow, monitor))
+                continue;
+            if (this._attachClone(pane, monitor, actor, metaWindow))
+                cloned = true;
+        }
+
+        if (!cloned)
+            this._attachPlaceholder(pane, monitor, window);
+    }
+
+    /**
+     * @param {Meta.Window} window
+     * @param {object} monitor
+     */
+    _shouldCloneWindow(window, monitor) {
+        if (!window || window.is_override_redirect())
+            return false;
+        if (window.get_window_type() === Meta.WindowType.DESKTOP)
+            return false;
+        return this._windowIntersectsMonitor(window, monitor);
+    }
+
+    _windowIntersectsMonitor(window, monitor) {
+        try {
+            const frame = window.get_frame_rect();
+            const geometry = global.display.get_monitor_geometry(this._monitorIndex);
+            const [intersects] = frame.intersect(geometry);
+            return intersects;
+        } catch {
+            return window.get_monitor() === this._monitorIndex;
+        }
+    }
+
+    /**
+     * Position a Clutter.Clone the way WorkspaceGroup._createClone does, but
+     * prefer transformed / buffer coords. Windowed actors often do not fill
+     * the pane; pinning them with actor.x/y (or 0,0) is why those slides
+     * looked like a no-op compared with fullscreen.
+     *
+     * @param {Clutter.Actor} pane
+     * @param {object} monitor
+     * @param {Clutter.Actor} windowActor
+     * @param {Meta.Window} window
+     * @returns {boolean}
+     */
+    _attachClone(pane, monitor, windowActor, window) {
+        if (!windowActor || window.minimized)
+            return false;
+        if (!(windowActor.width > 0 && windowActor.height > 0))
+            return false;
+
+        try {
+            const clone = new Clutter.Clone({source: windowActor});
+            const [x, y] = this._cloneOffset(windowActor, window, monitor);
+            clone.x = x;
+            clone.y = y;
+
+            windowActor.connectObject('destroy', () => {
+                try {
+                    clone.destroy();
+                } catch {
+                }
+            }, clone);
+
+            pane.add_child(clone);
+            return true;
+        } catch (e) {
+            console.error('[MacGesture] clone failed:', e);
+            return false;
+        }
+    }
+
+    /**
+     * @param {Clutter.Actor} actor
+     * @param {Meta.Window} window
+     * @param {object} monitor
+     * @returns {[number, number]}
+     */
+    _cloneOffset(actor, window, monitor) {
+        // Clutter.Clone paints from the source actor's origin, so the clone
+        // must sit at the actor's *stage* position relative to this monitor.
+        // actor.x is not enough: windowed Meta.WindowActor often has shadows
+        // and parent offsets (window_group) that fullscreen windows hide.
+        try {
+            const [tx, ty] = actor.get_transformed_position();
+            if (Number.isFinite(tx) && Number.isFinite(ty))
+                return [Math.round(tx - monitor.x), Math.round(ty - monitor.y)];
+        } catch {
+        }
+
+        try {
+            const rect = window.get_buffer_rect();
+            return [Math.round(rect.x - monitor.x), Math.round(rect.y - monitor.y)];
+        } catch {
+        }
+
+        return [Math.round(actor.x - monitor.x), Math.round(actor.y - monitor.y)];
+    }
+
+    /**
+     * @param {Clutter.Actor} actor
+     * @returns {[number, number]}
+     */
+    _stagePos(actor) {
+        try {
+            const [x, y] = actor.get_transformed_position();
+            if (Number.isFinite(x) && Number.isFinite(y))
+                return [x, y];
+        } catch {
+        }
+        return [actor.x, actor.y];
+    }
+
+    /**
+     * @param {Clutter.Actor} pane
+     * @param {object} monitor
+     * @param {Meta.Window} window
+     */
+    _attachPlaceholder(pane, monitor, window) {
         try {
             const app = this._tracker.get_window_app(window);
             const cardWidth = Math.min(monitor.width - 200, 960);
@@ -574,6 +801,8 @@ export class AppSwitcher {
                 width: cardWidth,
                 height: cardHeight,
                 layout_manager: new Clutter.BinLayout(),
+                x: Math.round((monitor.width - cardWidth) / 2),
+                y: Math.round((monitor.height - cardHeight) / 2),
             });
 
             const content = new St.BoxLayout({
@@ -586,9 +815,8 @@ export class AppSwitcher {
 
             const size = 128;
             let iconActor = null;
-            if (app) {
+            if (app)
                 iconActor = app.create_icon_texture(size);
-            }
             if (!iconActor) {
                 iconActor = new St.Icon({
                     icon_name: 'application-x-executable-symbolic',
@@ -599,23 +827,16 @@ export class AppSwitcher {
 
             const titleText = window.get_title() || app?.get_name() || '';
             if (titleText) {
-                const label = new St.Label({
+                content.add_child(new St.Label({
                     text: titleText,
                     style: 'font-size: 16pt; font-weight: bold; color: white; margin-top: 16px;',
-                });
-                content.add_child(label);
+                }));
             }
 
             box.add_child(content);
-
-            return {
-                actor: box,
-                x: Math.round((monitor.width - cardWidth) / 2),
-                y: Math.round((monitor.height - cardHeight) / 2),
-            };
+            pane.add_child(box);
         } catch (e) {
             console.error('[MacGesture] placeholder failed:', e);
-            return null;
         }
     }
 
