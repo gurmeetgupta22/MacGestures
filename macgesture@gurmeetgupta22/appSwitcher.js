@@ -20,7 +20,6 @@ import Mtk from 'gi://Mtk';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 
-import * as Background from 'resource:///org/gnome/shell/ui/background.js';
 import * as Layout from 'resource:///org/gnome/shell/ui/layout.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
@@ -51,15 +50,43 @@ class MacGestureSwitchOverlay extends St.Widget {
 
         // Render actual desktop wallpaper underneath so non-fullscreen windows
         // slide across wallpaper without an abrupt dark void.
-        const bgGroup = new Meta.BackgroundGroup();
-        this.add_child(bgGroup);
+        // We clone the existing desktop background directly instead of creating
+        // a new BackgroundManager. This avoids reloading wallpapers, triggering
+        // 1-second fade-in transitions, or conflicting with live wallpaper extensions
+        // (such as LiveEngine or Hanabi) which inject their live renderers into _backgroundGroup.
+        this._bgClone = null;
         try {
-            this._bgManager = new Background.BackgroundManager({
-                container: bgGroup,
-                monitorIndex,
-                controlPosition: false,
-            });
-        } catch {
+            const backgroundGroup = Main.layoutManager._backgroundGroup;
+            if (backgroundGroup) {
+                this._bgClone = new Clutter.Clone({
+                    source: backgroundGroup,
+                    x: -monitor.x,
+                    y: -monitor.y,
+                });
+                this.add_child(this._bgClone);
+            }
+        } catch (e) {
+            console.error('[MacGesture] failed to clone backgroundGroup:', e);
+        }
+
+        // Fallback: try monitor background actor if backgroundGroup wasn't cloneable
+        if (!this._bgClone) {
+            try {
+                const bgActor = Main.layoutManager._bgManagers?.[monitorIndex]?.backgroundActor;
+                if (bgActor) {
+                    this._bgClone = new Clutter.Clone({
+                        source: bgActor,
+                        x: 0,
+                        y: 0,
+                    });
+                    this.add_child(this._bgClone);
+                }
+            } catch (e) {
+                console.error('[MacGesture] failed to clone monitor background actor:', e);
+            }
+        }
+
+        if (!this._bgClone) {
             this._cover = new St.Widget({
                 style_class: 'macgesture-cover',
                 x_expand: true,
@@ -80,9 +107,9 @@ class MacGestureSwitchOverlay extends St.Widget {
     }
 
     destroy() {
-        if (this._bgManager) {
-            this._bgManager.destroy();
-            this._bgManager = null;
+        if (this._bgClone) {
+            this._bgClone.destroy();
+            this._bgClone = null;
         }
         super.destroy();
     }
