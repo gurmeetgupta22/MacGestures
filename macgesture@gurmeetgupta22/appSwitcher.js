@@ -122,6 +122,7 @@ export class AppSwitcher {
         this._monitorWidth = 0;
         this._live = true;
         this._progress = 0;
+        this._unredirectDisabled = false;
     }
 
     get busy() {
@@ -513,6 +514,7 @@ export class AppSwitcher {
 
     _createOverlay() {
         this._destroyOverlay();
+        this._disableUnredirect();
 
         const overlay = new SwitchOverlay(this._monitorIndex);
         this._overlay = overlay;
@@ -531,6 +533,7 @@ export class AppSwitcher {
     }
 
     _destroyOverlay() {
+        this._enableUnredirect();
         if (!this._overlay)
             return;
 
@@ -541,6 +544,33 @@ export class AppSwitcher {
             console.error('[MacGesture] overlay destroy failed:', e);
         }
         this._overlay = null;
+    }
+
+    // Mutter scans out unredirected (fullscreen/focused) windows directly, so
+    // their actor has no composited texture and Clutter.Clone paints blank —
+    // the slide then appears frozen until release. Mirror workspaceAnimation.js:
+    // keep unredirect disabled while the live overlay exists so clones capture
+    // window content and follow the fingers.
+    _disableUnredirect() {
+        if (this._unredirectDisabled)
+            return;
+        try {
+            global.compositor.disable_unredirect();
+            this._unredirectDisabled = true;
+        } catch (e) {
+            console.error('[MacGesture] disable_unredirect failed:', e);
+        }
+    }
+
+    _enableUnredirect() {
+        if (!this._unredirectDisabled)
+            return;
+        this._unredirectDisabled = false;
+        try {
+            global.compositor.enable_unredirect();
+        } catch (e) {
+            console.error('[MacGesture] enable_unredirect failed:', e);
+        }
     }
 
     /**
@@ -577,27 +607,16 @@ export class AppSwitcher {
     }
 
     /**
-     * Clone the existing wallpaper actor (js/ui/layout.js _bgManagers /
-     * _backgroundGroup). Do not construct BackgroundManager — that retriggers
-     * fade-in and fights live-wallpaper extensions.
+     * Clone the desktop background. Prefer the whole _backgroundGroup: live-
+     * wallpaper extensions (LiveEngine, Hanabi) reparent their renderer actor
+     * into that group on top of the static backgroundActor, so cloning only the
+     * per-monitor backgroundActor shows a frozen wallpaper. Never construct a
+     * BackgroundManager — that retriggers fade-in.
      *
      * @param {object} monitor
      * @returns {Clutter.Actor|null}
      */
     _cloneWallpaper(monitor) {
-        try {
-            const bgActor = Main.layoutManager._bgManagers?.[this._monitorIndex]?.backgroundActor;
-            if (bgActor) {
-                const clone = new Clutter.Clone({source: bgActor});
-                const [x, y] = this._stagePos(bgActor);
-                clone.x = x - monitor.x;
-                clone.y = y - monitor.y;
-                return clone;
-            }
-        } catch (e) {
-            console.error('[MacGesture] monitor wallpaper clone failed:', e);
-        }
-
         try {
             const group = Main.layoutManager._backgroundGroup;
             if (group) {
@@ -609,6 +628,19 @@ export class AppSwitcher {
             }
         } catch (e) {
             console.error('[MacGesture] backgroundGroup clone failed:', e);
+        }
+
+        try {
+            const bgActor = Main.layoutManager._bgManagers?.[this._monitorIndex]?.backgroundActor;
+            if (bgActor) {
+                const clone = new Clutter.Clone({source: bgActor});
+                const [x, y] = this._stagePos(bgActor);
+                clone.x = x - monitor.x;
+                clone.y = y - monitor.y;
+                return clone;
+            }
+        } catch (e) {
+            console.error('[MacGesture] monitor wallpaper clone failed:', e);
         }
 
         return null;
