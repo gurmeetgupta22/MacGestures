@@ -20,6 +20,7 @@ import Mtk from 'gi://Mtk';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 
+import * as Background from 'resource:///org/gnome/shell/ui/background.js';
 import * as Layout from 'resource:///org/gnome/shell/ui/layout.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
@@ -30,33 +31,60 @@ const CYCLE_HOLD_MS = 2000;
 const SwitchOverlay = GObject.registerClass(
 class MacGestureSwitchOverlay extends St.Widget {
     _init(monitorIndex) {
+        const monitor = Main.layoutManager.monitors[monitorIndex] ?? Main.layoutManager.primaryMonitor;
+
         super._init({
             style_class: 'macgesture-switch-overlay',
             clip_to_allocation: true,
             layout_manager: new Clutter.BinLayout(),
+            x: monitor.x,
+            y: monitor.y,
+            width: monitor.width,
+            height: monitor.height,
         });
 
         this._monitorIndex = monitorIndex;
+        this._monitor = monitor;
         this._records = [];
 
         this.add_constraint(new Layout.MonitorConstraint({index: monitorIndex}));
 
-        this._cover = new St.Widget({
-            style_class: 'macgesture-cover',
-            x_expand: true,
-            y_expand: true,
-            x_align: Clutter.ActorAlign.FILL,
-            y_align: Clutter.ActorAlign.FILL,
-        });
-        this.add_child(this._cover);
+        // Render actual desktop wallpaper underneath so non-fullscreen windows
+        // slide across wallpaper without an abrupt dark void.
+        const bgGroup = new Meta.BackgroundGroup();
+        this.add_child(bgGroup);
+        try {
+            this._bgManager = new Background.BackgroundManager({
+                container: bgGroup,
+                monitorIndex,
+                controlPosition: false,
+            });
+        } catch {
+            this._cover = new St.Widget({
+                style_class: 'macgesture-cover',
+                x_expand: true,
+                y_expand: true,
+                x_align: Clutter.ActorAlign.FILL,
+                y_align: Clutter.ActorAlign.FILL,
+            });
+            this.add_child(this._cover);
+        }
 
         this._slider = new Clutter.Actor({
-            x_expand: true,
-            y_expand: true,
-            x_align: Clutter.ActorAlign.FILL,
-            y_align: Clutter.ActorAlign.FILL,
+            x: 0,
+            y: 0,
+            width: monitor.width,
+            height: monitor.height,
         });
         this.add_child(this._slider);
+    }
+
+    destroy() {
+        if (this._bgManager) {
+            this._bgManager.destroy();
+            this._bgManager = null;
+        }
+        super.destroy();
     }
 
     /**
@@ -64,7 +92,7 @@ class MacGestureSwitchOverlay extends St.Widget {
      * @param {number} offsetX
      */
     addPane(visual, offsetX) {
-        const monitor = Main.layoutManager.monitors[this._monitorIndex];
+        const monitor = this._monitor;
         const pane = new Clutter.Actor({
             x: offsetX,
             y: 0,
@@ -105,6 +133,7 @@ class MacGestureSwitchOverlay extends St.Widget {
 
     stopEase() {
         this._slider.remove_all_transitions();
+        this.remove_all_transitions();
     }
 });
 
@@ -216,8 +245,22 @@ export class AppSwitcher {
         }
 
         const finish = () => {
-            if (commit)
+            if (commit) {
                 this._commitCycle(step);
+                // Keep the target window clone visible while smoothly fading out over 80ms.
+                // This eliminates any flash/glitch while Mutter restacks and activates the window.
+                if (this._overlay) {
+                    this._overlay.ease({
+                        opacity: 0,
+                        duration: 80,
+                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                        onComplete: () => {
+                            this._cleanupSwitch();
+                        },
+                    });
+                    return;
+                }
+            }
             this._cleanupSwitch();
         };
 
@@ -306,6 +349,17 @@ export class AppSwitcher {
             return false;
         }
 
+        // If focus changed outside the gesture, align cycleIndex with the currently focused window
+        const focus = global.display.focus_window;
+        if (focus) {
+            const focusIdx = kept.findIndex(entry => entry.window === focus);
+            if (focusIdx >= 0) {
+                this._cycleIndex = focusIdx;
+                this._cycle = kept;
+                return true;
+            }
+        }
+
         const currentWindow = this._cycle[this._cycleIndex]?.window;
         this._cycle = kept;
         const idx = kept.findIndex(entry => entry.window === currentWindow);
@@ -378,10 +432,11 @@ export class AppSwitcher {
 
         // Build one entry per window, keeping MRU order from get_tab_list.
         // This allows multiple windows of the same app to be cycled individually.
+        // Include every valid window even if an app tracker returns null.
         return windows.map(w => ({
-            app: this._tracker.get_window_app(w),
+            app: this._tracker.get_window_app(w) ?? null,
             window: w,
-        })).filter(entry => entry.app !== null);
+        }));
     }
 
     _createOverlay() {
@@ -424,10 +479,10 @@ export class AppSwitcher {
         if (!window)
             return null;
 
-        const monitor = Main.layoutManager.monitors[this._monitorIndex];
+        const monitor = Main.layoutManager.monitors[this._monitorIndex] ?? Main.layoutManager.primaryMonitor;
         const actor = window.get_compositor_private();
 
-        if (actor && window.showing_on_its_workspace()) {
+        if (actor && actor.width > 0 && actor.height > 0 && !window.minimized) {
             try {
                 const clone = new Clutter.Clone({
                     source: actor,
@@ -454,28 +509,54 @@ export class AppSwitcher {
             }
         }
 
-        // Minimized / missing actor: app icon placeholder so the swipe still
-        // shows a destination. Unminimize happens on activate().
+        // Minimized / missing actor: show an elegant window placeholder card
         try {
             const app = this._tracker.get_window_app(window);
-            const size = 192;
+            const cardWidth = Math.min(monitor.width - 200, 960);
+            const cardHeight = Math.min(monitor.height - 200, 600);
             const box = new St.Widget({
                 style_class: 'macgesture-placeholder',
-                width: size + 64,
-                height: size + 64,
-                x_align: Clutter.ActorAlign.CENTER,
-                y_align: Clutter.ActorAlign.CENTER,
+                width: cardWidth,
+                height: cardHeight,
                 layout_manager: new Clutter.BinLayout(),
             });
+
+            const content = new St.BoxLayout({
+                vertical: true,
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER,
+                x_expand: true,
+                y_expand: true,
+            });
+
+            const size = 128;
+            let iconActor = null;
             if (app) {
-                const icon = app.create_icon_texture(size);
-                box.add_child(icon);
+                iconActor = app.create_icon_texture(size);
             }
-            const frame = window.get_frame_rect();
+            if (!iconActor) {
+                iconActor = new St.Icon({
+                    icon_name: 'application-x-executable-symbolic',
+                    icon_size: size,
+                });
+            }
+            content.add_child(iconActor);
+
+            const titleText = window.get_title() || app?.get_name() || '';
+            if (titleText) {
+                const label = new St.Label({
+                    text: titleText,
+                    style: 'font-size: 16pt; font-weight: bold; color: white; margin-top: 16px;',
+                });
+                content.add_child(label);
+            }
+
+            box.add_child(content);
+
             return {
                 actor: box,
-                x: Math.max(0, frame.x - monitor.x),
-                y: Math.max(0, frame.y - monitor.y),
+                x: Math.round((monitor.width - cardWidth) / 2),
+                y: Math.round((monitor.height - cardHeight) / 2),
             };
         } catch (e) {
             console.error('[MacGesture] placeholder failed:', e);

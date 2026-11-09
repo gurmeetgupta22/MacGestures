@@ -216,7 +216,10 @@ export class OtherGestureHandler {
                         direction = this._dy > 0 ? 'swipe-down' : 'swipe-up';
 
                     this._swipeKey = `${this._swipePrefix}-${direction}`;
-                    const actionType = this._settings.get_int(`${this._swipeKey}-action`);
+                    const actionKey = `${this._swipeKey}-action`;
+                    if (!this._settings?.settings_schema?.has_key(actionKey))
+                        return Clutter.EVENT_STOP;
+                    const actionType = this._settings.get_int(actionKey);
                     const isVert = direction === 'swipe-up' || direction === 'swipe-down';
 
                     if (isVert && actionType === V.VOLUME)
@@ -333,7 +336,9 @@ export class OtherGestureHandler {
     }
 
     _executeAction(key) {
-        const actionType = this._settings?.get_int(`${key}-action`);
+        const actionKey = `${key}-action`;
+        if (!this._settings?.settings_schema?.has_key(actionKey)) return;
+        const actionType = this._settings.get_int(actionKey);
         if (actionType === undefined || actionType === null) return;
 
         const isUp    = key.endsWith('swipe-up');
@@ -800,31 +805,38 @@ export class GestureHandler {
                 const dist = Math.hypot(this._cumulativeX, this._cumulativeY);
                 if (dist >= DRAG_THRESHOLD_DISTANCE) {
                     const isHoriz = Math.abs(this._cumulativeX) > Math.abs(this._cumulativeY);
+                    const initDelta = this._cumulativeX;
                     this._cumulativeX = 0;
                     this._cumulativeY = 0;
 
-                    if (isHoriz && this._callbacks.canBegin()) {
-                        // → confirmed horizontal: app-switch path
-                        // OtherGestureHandler's buffered state is no longer needed
-                        if (this._other)
-                            this._other.reset();
-                        this._appSwitchState = AppSwitchState.HANDLING;
-                        this._progress = 0;
-                        this._history.reset();
-                        this._history.append(time, 0);
-                        if (!this._callbacks.onBegin())
+                    if (isHoriz) {
+                        if (this._callbacks.canBegin()) {
+                            // → confirmed horizontal: app-switch path
+                            if (this._other)
+                                this._other.reset();
+                            this._appSwitchState = AppSwitchState.HANDLING;
+                            const distance = TOUCHPAD_BASE_WIDTH;
+                            const logicalDelta = this._logicalDelta(initDelta);
+                            this._progress = Math.clamp(logicalDelta / distance, -1, 1);
+                            this._history.reset();
+                            this._history.append(time, logicalDelta);
+                            if (this._callbacks.onBegin()) {
+                                this._callbacks.onUpdate(this._progress);
+                            } else {
+                                this._appSwitchState = AppSwitchState.IGNORED;
+                            }
+                        } else {
+                            if (this._other)
+                                this._other.reset();
                             this._appSwitchState = AppSwitchState.IGNORED;
+                        }
                     } else {
-                        // → confirmed vertical / other: hand off to OtherGestureHandler
+                        // → confirmed vertical: hand off to OtherGestureHandler
                         this._appSwitchState = AppSwitchState.IGNORED;
-                        // OtherGestureHandler already has BEGIN; now send this UPDATE
                         if (this._other)
                             this._other.handleSwipe(event, n);
                     }
                 }
-                // While still PENDING, don't forward to OtherGestureHandler —
-                // it would try to look up three-swipe-left/right schema keys
-                // that don't exist (horizontal is owned by the app-switcher).
                 return Clutter.EVENT_STOP;
             }
 
@@ -877,27 +889,32 @@ export class GestureHandler {
         const progress = this._progress;
         const normVelocity = velocity / distance;
 
+        // Any flick with noticeable velocity commits the switch in that direction
         if (Math.abs(normVelocity) >= VELOCITY_THRESHOLD_TOUCHPAD) {
-            if (normVelocity > 0 && progress > 0) return 1;
-            if (normVelocity < 0 && progress < 0) return -1;
+            return normVelocity > 0 ? 1 : -1;
         }
-        if (progress >= threshold)  return 1;
-        if (progress <= -threshold) return -1;
+
+        // Even with lower velocity, a swipe that reached at least 20% (or configured threshold) commits
+        const commitDistance = Math.min(threshold, 0.20);
+        if (progress >= commitDistance)  return 1;
+        if (progress <= -commitDistance) return -1;
+
         return 0;
     }
 
     _pickDuration(velocity, distance, endProgress) {
         const configured = this._settings.get_int('animation-duration');
-        let v = velocity / distance;
-        if ((endProgress - this._progress) * v <= 0)
+        let v = Math.abs(velocity / distance);
+        if (v < ANIMATION_BASE_VELOCITY)
             v = ANIMATION_BASE_VELOCITY;
 
-        let duration = Math.abs((this._progress - endProgress) / v * DURATION_MULTIPLIER);
+        const remaining = Math.abs(endProgress - this._progress);
+        let duration = (remaining / v) * DURATION_MULTIPLIER;
         if (duration > 0)
             duration = Math.clamp(duration, MIN_ANIMATION_DURATION, MAX_ANIMATION_DURATION);
         else
             duration = configured;
 
-        return Math.round(Math.clamp((duration + configured) / 2, 100, 500));
+        return Math.round(Math.clamp((duration + configured) / 2, 120, 320));
     }
 }
