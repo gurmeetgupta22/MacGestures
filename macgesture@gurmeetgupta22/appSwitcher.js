@@ -177,6 +177,8 @@ export class AppSwitcher {
         this._cycle = null;
         this._cycleIndex = 0;
         this._cycleTimeoutId = 0;
+        this._finishLaterId = 0;
+        this._finishIdleId = 0;
         this._monitorIndex = 0;
         this._monitorWidth = 0;
         this._live = true;
@@ -274,19 +276,33 @@ export class AppSwitcher {
         const finish = () => {
             if (commit) {
                 this._commitCycle(step);
-                // Keep the target window clone visible while smoothly fading out over 80ms.
-                // This eliminates any flash/glitch while Mutter restacks and activates the window.
-                if (this._overlay) {
-                    this._overlay.ease({
-                        opacity: 0,
-                        duration: 80,
-                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                        onComplete: () => {
+                // Keep the target window clone visible at 100% opacity until Mutter
+                // completes restacking (SYNC_STACK) and prepares to draw the real window.
+                // We NEVER fade out the overlay's opacity: fading makes the window clone
+                // translucent and exposes the wallpaper underneath.
+                // Mutter processes SYNC_STACK before BEFORE_REDRAW, so destroying the overlay
+                // in BEFORE_REDRAW guarantees the real window is already raised on the
+                // exact frame the overlay disappears.
+                try {
+                    const laters = global.compositor?.get_laters?.();
+                    if (laters) {
+                        this._finishLaterId = laters.add(Meta.LaterType.BEFORE_REDRAW, () => {
+                            this._finishLaterId = 0;
                             this._cleanupSwitch();
-                        },
-                    });
-                    return;
+                            return GLib.SOURCE_REMOVE;
+                        });
+                        return;
+                    }
+                } catch (e) {
+                    console.error('[MacGesture] laters.add failed:', e);
                 }
+
+                this._finishIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                    this._finishIdleId = 0;
+                    this._cleanupSwitch();
+                    return GLib.SOURCE_REMOVE;
+                });
+                return;
             }
             this._cleanupSwitch();
         };
@@ -321,6 +337,18 @@ export class AppSwitcher {
     }
 
     _cleanupSwitch() {
+        if (this._finishLaterId) {
+            try {
+                const laters = global.compositor?.get_laters?.();
+                laters?.remove(this._finishLaterId);
+            } catch {}
+            this._finishLaterId = 0;
+        }
+        if (this._finishIdleId) {
+            GLib.source_remove(this._finishIdleId);
+            this._finishIdleId = 0;
+        }
+
         this._destroyOverlay();
         this._busy = false;
         this._fromWindow = null;
