@@ -12,3 +12,7 @@
     border: 1px solid rgba(255, 255, 255, 0.12);
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
 }
+
+.macgesture-float-card {
+    box-shadow: 0 20px 48px rgba(0, 0, 0, 0.38);
+}

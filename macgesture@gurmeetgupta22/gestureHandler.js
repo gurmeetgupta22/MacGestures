@@ -915,6 +915,6 @@ export class GestureHandler {
         else
             duration = configured;
 
-        return Math.round(Math.clamp((duration + configured) / 2, 120, 320));
+        return Math.round(Math.clamp((duration + configured) / 2, 220, 380));
     }
 }

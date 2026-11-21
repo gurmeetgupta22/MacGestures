@@ -6,15 +6,17 @@
 //   Shell.AppSystem.get_running() (sorted by shell_app_compare / last user time)
 //   then getWindows(workspace) via display.get_tab_list(Meta.TabList.NORMAL_ALL).
 //
-// Cycling mirrors holding Super+Tab: the list is frozen while you keep swiping
-// so both directions walk every app. Rebuilding MRU after each switch made one
-// direction toggle between two apps. After CYCLE_HOLD_MS with no swipe, rebuild.
+// Cycling: freeze the window list until the user focuses a window we did not
+// activate. Opposite swipe then returns along the same path (Chrome → Cursor
+// → Chrome) instead of wrapping to the oldest MRU entry (Spotify).
 //
-// Live overlay mirrors js/ui/workspaceAnimation.js WorkspaceGroup.
+// Animation: static wallpaper, window cards float from the side with
+// EASE_OUT_QUINT and a slight scale.
 
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Graphene from 'gi://Graphene';
 import Meta from 'gi://Meta';
 import Mtk from 'gi://Mtk';
 import Shell from 'gi://Shell';
@@ -23,9 +25,9 @@ import St from 'gi://St';
 import * as Layout from 'resource:///org/gnome/shell/ui/layout.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-// Super+Tab keeps its order until Alt/Super is released. We keep ours for a
-// short idle so successive swipes continue through the same cycle.
-const CYCLE_HOLD_MS = 2000;
+// Frozen until the user focuses a window we did not activate (click / Alt+Tab).
+// A short timeout was rebuilding MRU so the opposite swipe wrapped to the
+// oldest app (Chrome → Cursor, then left → Spotify instead of back to Chrome).
 
 const SwitchOverlay = GObject.registerClass(
 class MacGestureSwitchOverlay extends St.Widget {
@@ -44,8 +46,13 @@ class MacGestureSwitchOverlay extends St.Widget {
         this._monitorIndex = monitorIndex;
         this._monitor = monitor;
         this._records = [];
+        this._width = monitor.width;
 
         this.add_constraint(new Layout.MonitorConstraint({index: monitorIndex}));
+
+        // Wallpaper stays put. Only the window cards slide, so windowed apps
+        // float in from the side instead of dragging the whole desktop.
+        this._wallpaper = null;
 
         this._slider = new Clutter.Actor({
             x: 0,
@@ -56,11 +63,18 @@ class MacGestureSwitchOverlay extends St.Widget {
         this.add_child(this._slider);
     }
 
+    setWallpaper(actor) {
+        if (this._wallpaper) {
+            this._wallpaper.destroy();
+            this._wallpaper = null;
+        }
+        if (!actor)
+            return;
+        this._wallpaper = actor;
+        this.insert_child_below(actor, this._slider);
+    }
+
     /**
-     * Insert a full-monitor pane. Wallpaper lives *inside* each pane so
-     * windowed apps slide as a complete desktop, like WorkspaceGroup in
-     * js/ui/workspaceAnimation.js — not as a floating clone over a static bg.
-     *
      * @param {Clutter.Actor} pane
      * @param {number} offsetX
      */
@@ -69,21 +83,28 @@ class MacGestureSwitchOverlay extends St.Widget {
         pane.y = 0;
         pane.width = this._monitor.width;
         pane.height = this._monitor.height;
+        pane.pivot_point = new Graphene.Point({x: 0.5, y: 0.5});
         this._slider.add_child(pane);
         this._records.push(pane);
         return pane;
     }
 
     setProgress(progress, width) {
-        this._slider.translation_x = -Math.round(progress * width);
+        this._width = width;
+        // Subpixel translation: rounding every touchpad event stutters.
+        this._slider.translation_x = -progress * width;
+        this._applyCardMotion(progress);
     }
 
     easeTo(progress, width, duration, onComplete) {
+        this._width = width;
         this._slider.remove_all_transitions();
+        this._records.forEach(pane => pane.remove_all_transitions());
+
         this._slider.ease({
-            translation_x: -Math.round(progress * width),
+            translation_x: -progress * width,
             duration,
-            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+            mode: Clutter.AnimationMode.EASE_OUT_QUINT ?? Clutter.AnimationMode.EASE_OUT_CUBIC,
             onComplete: () => {
                 try {
                     onComplete();
@@ -92,10 +113,45 @@ class MacGestureSwitchOverlay extends St.Widget {
                 }
             },
         });
+
+        const t = Math.min(1, Math.abs(progress));
+        for (const pane of this._records) {
+            const isCurrent = pane === this._records[1];
+            const scale = isCurrent ? 1 - 0.045 * t : 0.955 + 0.045 * t;
+            const opacity = isCurrent ? 255 * (1 - 0.12 * t) : 255;
+            pane.ease({
+                scale_x: scale,
+                scale_y: scale,
+                opacity,
+                duration,
+                mode: Clutter.AnimationMode.EASE_OUT_QUINT ?? Clutter.AnimationMode.EASE_OUT_CUBIC,
+            });
+        }
+    }
+
+    _applyCardMotion(progress) {
+        const t = Math.min(1, Math.abs(progress));
+        const current = this._records[1];
+        const incoming = progress < 0 ? this._records[0] : this._records[2];
+        const outgoingSide = progress < 0 ? this._records[2] : this._records[0];
+
+        if (current) {
+            current.scale_x = current.scale_y = 1 - 0.045 * t;
+            current.opacity = Math.round(255 * (1 - 0.12 * t));
+        }
+        if (incoming) {
+            incoming.scale_x = incoming.scale_y = 0.955 + 0.045 * t;
+            incoming.opacity = 255;
+        }
+        if (outgoingSide && outgoingSide !== incoming) {
+            outgoingSide.scale_x = outgoingSide.scale_y = 0.955;
+            outgoingSide.opacity = 255;
+        }
     }
 
     stopEase() {
         this._slider.remove_all_transitions();
+        this._records.forEach(pane => pane.remove_all_transitions());
         this.remove_all_transitions();
     }
 });
@@ -112,7 +168,11 @@ export class AppSwitcher {
         this._backWindow = null;
         this._cycle = null;
         this._cycleIndex = 0;
-        this._cycleTimeoutId = 0;
+        this._activatedByUs = null;
+        this._activateTime = 0;
+        this._focusHandlerId = global.display.connect(
+            'notify::focus-window',
+            () => this._onFocusWindowChanged());
         this._finishLaterId = 0;
         this._finishIdleId = 0;
         this._finishWatchdogId = 0;
@@ -161,7 +221,6 @@ export class AppSwitcher {
 
     begin() {
         this._interrupt();
-        this._clearCycleTimeout();
         if (!this._ensureCycle())
             return false;
 
@@ -267,8 +326,12 @@ export class AppSwitcher {
         this._pendingStep = 0;
         this.cancel();
         this._clearFinishSources();
-        this._clearCycleTimeout();
+        if (this._focusHandlerId) {
+            global.display.disconnect(this._focusHandlerId);
+            this._focusHandlerId = 0;
+        }
         this._cycle = null;
+        this._activatedByUs = null;
         this._settings = null;
         this._tracker = null;
     }
@@ -382,7 +445,22 @@ export class AppSwitcher {
         this._forwardWindow = null;
         this._backWindow = null;
         this._progress = 0;
-        this._armCycleTimeout();
+    }
+
+    _onFocusWindowChanged() {
+        if (this._busy)
+            return;
+        if (this._activateTime &&
+            GLib.get_monotonic_time() - this._activateTime < 500000)
+            return;
+        const focus = global.display.focus_window;
+        if (!focus || focus === this._activatedByUs)
+            return;
+        // User clicked / Alt+Tabbed to a different window: start a fresh MRU
+        // list on the next swipe so the frozen path does not fight them.
+        this._cycle = null;
+        this._cycleIndex = 0;
+        this._activatedByUs = null;
     }
 
     _cycleLength() {
@@ -390,8 +468,15 @@ export class AppSwitcher {
     }
 
     _ensureCycle() {
-        if (this._refreshCycle())
+        if (this._refreshCycle()) {
+            const anchor = this._activatedByUs ?? global.display.focus_window;
+            if (anchor) {
+                const idx = this._cycle.findIndex(entry => entry.window === anchor);
+                if (idx >= 0)
+                    this._cycleIndex = idx;
+            }
             return true;
+        }
 
         const apps = this._listApps();
         if (apps.length < 2)
@@ -457,24 +542,6 @@ export class AppSwitcher {
         this._activate(this._cycle[this._cycleIndex].window);
     }
 
-    _armCycleTimeout() {
-        this._clearCycleTimeout();
-        this._cycleTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, CYCLE_HOLD_MS, () => {
-            this._cycleTimeoutId = 0;
-            this._cycle = null;
-            this._cycleIndex = 0;
-            return GLib.SOURCE_REMOVE;
-        });
-        GLib.Source.set_name_by_id(this._cycleTimeoutId, '[MacGesture] cycle hold');
-    }
-
-    _clearCycleTimeout() {
-        if (this._cycleTimeoutId) {
-            GLib.source_remove(this._cycleTimeoutId);
-            this._cycleTimeoutId = 0;
-        }
-    }
-
     _pickMonitorIndex() {
         const [x, y] = global.get_pointer();
         // mutter 12+/GNOME 45+: geometry types live in Mtk, not Meta.Rectangle.
@@ -519,9 +586,14 @@ export class AppSwitcher {
         const overlay = new SwitchOverlay(this._monitorIndex);
         this._overlay = overlay;
 
+        const monitor = Main.layoutManager.monitors[this._monitorIndex] ?? Main.layoutManager.primaryMonitor;
+        const wallpaper = this._cloneWallpaper(monitor) ?? this._solidCover(monitor);
+        overlay.setWallpaper(wallpaper);
+
         const width = this._monitorWidth;
-        // Next in Alt+Tab order comes from the left so a right swipe (natural
-        // scrolling: content follows fingers) lands on the previously used app.
+        // Cards are window clones only (wallpaper is static behind them).
+        // Right swipe (natural, negative progress) brings _forwardWindow from
+        // the left; left swipe brings _backWindow from the right.
         overlay.addPane(this._makePane(this._forwardWindow, false), -width);
         overlay.addPane(this._makePane(this._fromWindow, true), 0);
         overlay.addPane(this._makePane(this._backWindow, false), width);
@@ -592,15 +664,7 @@ export class AppSwitcher {
             clip_to_allocation: true,
         });
 
-        const wallpaper = this._cloneWallpaper(monitor);
-        if (wallpaper)
-            pane.add_child(wallpaper);
-        else
-            pane.add_child(this._solidCover(monitor));
-
-        if (snapshotMonitor)
-            this._addMonitorWindowClones(pane, monitor);
-        else if (window)
+        if (window)
             this._addWindowClones(pane, monitor, window);
 
         return pane;
@@ -655,28 +719,8 @@ export class AppSwitcher {
     }
 
     /**
-     * Bottom-to-top stack of every window currently painted on this monitor.
-     * Mirrors WorkspaceGroup._createWindows() so the outgoing pane matches
-     * what the user sees.
-     *
-     * @param {Clutter.Actor} pane
-     * @param {object} monitor
-     */
-    _addMonitorWindowClones(pane, monitor) {
-        const actors = global.get_window_actors();
-        for (const actor of actors) {
-            const metaWindow = actor.meta_window;
-            if (!this._shouldCloneWindow(metaWindow, monitor))
-                continue;
-            if (!metaWindow.showing_on_its_workspace())
-                continue;
-            this._attachClone(pane, monitor, actor, metaWindow);
-        }
-    }
-
-    /**
-     * Incoming pane: the destination window plus attached dialogs, in stack
-     * order, so a windowed app sits on wallpaper at its real frame.
+     * Destination / current pane: that window plus attached dialogs, so a
+     * windowed app floats at its real frame over the static wallpaper.
      *
      * @param {Clutter.Actor} pane
      * @param {object} monitor
@@ -757,19 +801,33 @@ export class AppSwitcher {
             return false;
 
         try {
-            const clone = new Clutter.Clone({source: windowActor});
             const [x, y] = this._cloneOffset(windowActor, window, monitor);
-            clone.x = x;
-            clone.y = y;
+            const card = new St.Widget({
+                style_class: 'macgesture-float-card',
+                layout_manager: new Clutter.BinLayout(),
+                x,
+                y,
+                width: windowActor.width,
+                height: windowActor.height,
+                clip_to_allocation: true,
+            });
+            const clone = new Clutter.Clone({
+                source: windowActor,
+                x: 0,
+                y: 0,
+                width: windowActor.width,
+                height: windowActor.height,
+            });
+            card.add_child(clone);
 
             windowActor.connectObject('destroy', () => {
                 try {
-                    clone.destroy();
+                    card.destroy();
                 } catch {
                 }
-            }, clone);
+            }, card);
 
-            pane.add_child(clone);
+            pane.add_child(card);
             return true;
         } catch (e) {
             console.error('[MacGesture] clone failed:', e);
@@ -883,6 +941,8 @@ export class AppSwitcher {
             const time = global.get_current_time();
             // js/ui/main.js activateWindow: focuses, unminimizes, and
             // activates the workspace as needed.
+            this._activatedByUs = window;
+            this._activateTime = GLib.get_monotonic_time();
             Main.activateWindow(window, time);
         } catch (e) {
             console.error('[MacGesture] activate failed:', e);
