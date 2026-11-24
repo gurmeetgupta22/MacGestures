@@ -216,7 +216,7 @@ export class AppSwitcher {
             focus && focus.is_fullscreen())
             return false;
 
-        return this._cycleLength() >= 2 || this._listApps().length >= 2;
+        return this._cycleLength() >= 1 || this._listApps().length >= 1;
     }
 
     begin() {
@@ -262,11 +262,12 @@ export class AppSwitcher {
         if (!this._busy)
             return;
 
+        const isSingle = this._cycleLength() === 1;
         const step = endProgress < 0 ? 1 : endProgress > 0 ? -1 : 0;
-        const commit = step !== 0;
-        this._pendingStep = step;
+        const commit = isSingle || step !== 0;
+        this._pendingStep = isSingle ? 1 : step;
         if (commit)
-            this._toWindow = step > 0 ? this._forwardWindow : this._backWindow;
+            this._toWindow = isSingle ? this._cycle[0].window : (step > 0 ? this._forwardWindow : this._backWindow);
 
         if (!this._live || !this._overlay) {
             if (commit)
@@ -479,7 +480,7 @@ export class AppSwitcher {
         }
 
         const apps = this._listApps();
-        if (apps.length < 2)
+        if (apps.length < 1)
             return false;
 
         this._cycle = apps;
@@ -496,7 +497,7 @@ export class AppSwitcher {
     }
 
     _refreshCycle() {
-        if (!this._cycle || this._cycle.length < 2)
+        if (!this._cycle || this._cycle.length < 1)
             return false;
 
         const live = this._listApps();
@@ -509,7 +510,7 @@ export class AppSwitcher {
                 kept.push(fresh);
         }
 
-        if (kept.length < 2) {
+        if (kept.length < 1) {
             this._cycle = null;
             this._cycleIndex = 0;
             return false;
@@ -535,7 +536,16 @@ export class AppSwitcher {
 
     _commitCycle(step) {
         const n = this._cycleLength();
-        if (n < 2 || step === 0)
+        if (n < 1)
+            return;
+
+        if (n === 1) {
+            this._cycleIndex = 0;
+            this._activate(this._cycle[0].window);
+            return;
+        }
+
+        if (step === 0)
             return;
 
         this._cycleIndex = (this._cycleIndex + step + n) % n;
