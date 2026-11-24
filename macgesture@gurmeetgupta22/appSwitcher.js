@@ -129,7 +129,73 @@ class MacGestureSwitchOverlay extends St.Widget {
         }
     }
 
+    /**
+     * Elastic bounce-back: slide the current pane to `peakProgress` then spring
+     * back to 0, giving the user a tactile "can't go further" feedback.
+     * onComplete is called when the animation is fully back at rest.
+     * @param {number} peakProgress  Fraction of width to slide (e.g. 0.12 for ~12%)
+     * @param {number} width         Monitor width in px
+     * @param {Function} onComplete
+     */
+    easeBounceTo(peakProgress, width, onComplete) {
+        this._slider.remove_all_transitions();
+        this._records.forEach(pane => pane.remove_all_transitions());
+
+        // Phase 1 – slide out quickly
+        this._slider.ease({
+            translation_x: -peakProgress * width,
+            duration: 120,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            onComplete: () => {
+                // Phase 2 – spring back to 0 with overshoot feel
+                this._slider.ease({
+                    translation_x: 0,
+                    duration: 220,
+                    mode: Clutter.AnimationMode.EASE_OUT_ELASTIC ??
+                          Clutter.AnimationMode.EASE_OUT_BACK ??
+                          Clutter.AnimationMode.EASE_OUT_CUBIC,
+                    onComplete: () => {
+                        try {
+                            onComplete();
+                        } catch (e) {
+                            console.error('[MacGesture] bounce complete failed:', e);
+                        }
+                    },
+                });
+            },
+        });
+
+        // Phase 1 – subtle scale pulse on the single pane
+        const pane = this._records[1] ?? this._records[0];
+        if (pane) {
+            pane.ease({
+                scale_x: 0.97,
+                scale_y: 0.97,
+                duration: 120,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                onComplete: () => {
+                    pane.ease({
+                        scale_x: 1.0,
+                        scale_y: 1.0,
+                        duration: 220,
+                        mode: Clutter.AnimationMode.EASE_OUT_ELASTIC ??
+                              Clutter.AnimationMode.EASE_OUT_BACK ??
+                              Clutter.AnimationMode.EASE_OUT_CUBIC,
+                    });
+                },
+            });
+        }
+    }
+
     _applyCardMotion(progress) {
+        if (this._records.length === 1) {
+            const t = Math.min(1, Math.abs(progress));
+            const pane = this._records[0];
+            pane.scale_x = pane.scale_y = 1 - 0.03 * t;
+            pane.opacity = 255;
+            return;
+        }
+
         const t = Math.min(1, Math.abs(progress));
         const current = this._records[1];
         const incoming = progress < 0 ? this._records[0] : this._records[2];
@@ -183,6 +249,7 @@ export class AppSwitcher {
         this._live = true;
         this._progress = 0;
         this._unredirectDisabled = false;
+        this._singleBounce = false;
     }
 
     get busy() {
@@ -216,7 +283,124 @@ export class AppSwitcher {
             focus && focus.is_fullscreen())
             return false;
 
-        return this._cycleLength() >= 1 || this._listApps().length >= 1;
+        return this._cycleLength() >= 2 || this._listApps().length >= 2;
+    }
+
+    /**
+     * Whether there is exactly one open window and it is minimized.
+     * Used by gestureHandler to decide whether to trigger a single-window reveal.
+     */
+    canRevealSingle() {
+        if (Main.overview.visible) return false;
+        if (Main.sessionMode.isLocked) return false;
+        if (Main.modalCount > 0) return false;
+        if (Main.actionMode !== Shell.ActionMode.NORMAL) return false;
+
+        const apps = this._listApps();
+        return apps.length === 1 && apps[0].window.minimized;
+    }
+
+    /**
+     * Whether there is exactly one open window and it is NOT minimized (user
+     * is actively using it). Swiping should bounce back and do nothing.
+     */
+    shouldBounce() {
+        if (Main.overview.visible) return false;
+        if (Main.sessionMode.isLocked) return false;
+        if (Main.modalCount > 0) return false;
+        if (Main.actionMode !== Shell.ActionMode.NORMAL) return false;
+
+        const apps = this._listApps();
+        return apps.length === 1 && !apps[0].window.minimized;
+    }
+
+    /**
+     * Start a "bounce back" gesture for the case where only one non-minimized
+     * window is open. The overlay shows the current window and snaps back.
+     * Returns true if the bounce was started.
+     */
+    beginBounce() {
+        this._interrupt();
+
+        const apps = this._listApps();
+        if (apps.length !== 1 || apps[0].window.minimized)
+            return false;
+
+        this._busy = true;
+        this._live = this._settings.get_string('animation-style') === 'live';
+        this._monitorIndex = this._pickMonitorIndex();
+        const monitor = Main.layoutManager.monitors[this._monitorIndex];
+        this._monitorWidth = monitor?.width ?? Main.layoutManager.primaryMonitor.width;
+        this._singleBounce = true;
+
+        if (this._live) {
+            try {
+                this._createBounceOverlay(apps[0].window);
+            } catch (e) {
+                console.error('[MacGesture] bounce overlay failed:', e);
+                this._destroyOverlay();
+                this._live = false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Reveal and activate the single minimized window (no overlay needed).
+     */
+    revealSingle() {
+        const apps = this._listApps();
+        if (apps.length !== 1 || !apps[0].window.minimized)
+            return;
+        this._activate(apps[0].window);
+    }
+
+    /**
+     * Called by gestureHandler during a bounce swipe to update the visual.
+     * We pass through to the normal update but clamp to a small range so it
+     * feels "springy" and doesn't go too far.
+     */
+    updateBounce(progress) {
+        if (!this._singleBounce || !this._live || !this._overlay)
+            return;
+        // Clamp to ±15% — the window can't slide off screen in bounce mode
+        const clamped = Math.sign(progress) * Math.min(Math.abs(progress), 0.15);
+        try {
+            this._overlay.setProgress(clamped, this._monitorWidth);
+        } catch (e) {
+            console.error('[MacGesture] bounce update failed:', e);
+        }
+    }
+
+    /**
+     * End a bounce gesture — spring back to 0 and clean up.
+     */
+    endBounce(currentProgress) {
+        if (!this._busy || !this._singleBounce)
+            return;
+
+        if (!this._live || !this._overlay) {
+            this._singleBounce = false;
+            this._cleanupSwitch();
+            return;
+        }
+
+        const generation = this._finishGeneration;
+        const peak = Math.sign(currentProgress) * Math.min(Math.abs(currentProgress), 0.15);
+
+        try {
+            this._overlay.easeBounceTo(peak, this._monitorWidth, () => {
+                if (generation !== this._finishGeneration) return;
+                this._singleBounce = false;
+                this._cleanupSwitch();
+            });
+            this._armFinishWatchdog(generation, 340);
+        } catch (e) {
+            console.error('[MacGesture] bounce end failed:', e);
+            this._singleBounce = false;
+            this._cleanupSwitch();
+        }
     }
 
     begin() {
@@ -262,12 +446,11 @@ export class AppSwitcher {
         if (!this._busy)
             return;
 
-        const isSingle = this._cycleLength() === 1;
         const step = endProgress < 0 ? 1 : endProgress > 0 ? -1 : 0;
-        const commit = isSingle || step !== 0;
-        this._pendingStep = isSingle ? 1 : step;
+        const commit = step !== 0;
+        this._pendingStep = step;
         if (commit)
-            this._toWindow = isSingle ? this._cycle[0].window : (step > 0 ? this._forwardWindow : this._backWindow);
+            this._toWindow = step > 0 ? this._forwardWindow : this._backWindow;
 
         if (!this._live || !this._overlay) {
             if (commit)
@@ -313,6 +496,7 @@ export class AppSwitcher {
 
         this._finishGeneration++;
         this._pendingStep = 0;
+        this._singleBounce = false;
         try {
             this._overlay?.stopEase();
         } catch (e) {
@@ -438,6 +622,7 @@ export class AppSwitcher {
     _cleanupSwitch() {
         this._clearFinishSources();
         this._pendingStep = 0;
+        this._singleBounce = false;
 
         this._destroyOverlay();
         this._busy = false;
@@ -480,7 +665,7 @@ export class AppSwitcher {
         }
 
         const apps = this._listApps();
-        if (apps.length < 1)
+        if (apps.length < 2)
             return false;
 
         this._cycle = apps;
@@ -497,7 +682,7 @@ export class AppSwitcher {
     }
 
     _refreshCycle() {
-        if (!this._cycle || this._cycle.length < 1)
+        if (!this._cycle || this._cycle.length < 2)
             return false;
 
         const live = this._listApps();
@@ -510,7 +695,7 @@ export class AppSwitcher {
                 kept.push(fresh);
         }
 
-        if (kept.length < 1) {
+        if (kept.length < 2) {
             this._cycle = null;
             this._cycleIndex = 0;
             return false;
@@ -536,16 +721,7 @@ export class AppSwitcher {
 
     _commitCycle(step) {
         const n = this._cycleLength();
-        if (n < 1)
-            return;
-
-        if (n === 1) {
-            this._cycleIndex = 0;
-            this._activate(this._cycle[0].window);
-            return;
-        }
-
-        if (step === 0)
+        if (n < 2 || step === 0)
             return;
 
         this._cycleIndex = (this._cycleIndex + step + n) % n;
@@ -614,6 +790,28 @@ export class AppSwitcher {
         overlay.setProgress(0, width);
     }
 
+    /**
+     * Create a one-pane overlay for the bounce animation (single visible window).
+     * Only the current-window pane is added; nothing to slide in from sides.
+     */
+    _createBounceOverlay(window) {
+        this._destroyOverlay();
+        this._disableUnredirect();
+
+        const overlay = new SwitchOverlay(this._monitorIndex);
+        this._overlay = overlay;
+
+        const monitor = Main.layoutManager.monitors[this._monitorIndex] ?? Main.layoutManager.primaryMonitor;
+        const wallpaper = this._cloneWallpaper(monitor) ?? this._solidCover(monitor);
+        overlay.setWallpaper(wallpaper);
+
+        // Single centre pane only — no left/right neighbours
+        overlay.addPane(this._makePane(window, true), 0);
+
+        Main.uiGroup.insert_child_above(overlay, global.window_group);
+        overlay.setProgress(0, this._monitorWidth);
+    }
+
     _destroyOverlay() {
         this._enableUnredirect();
         if (!this._overlay)
@@ -648,6 +846,7 @@ export class AppSwitcher {
         if (!this._unredirectDisabled)
             return;
         this._unredirectDisabled = false;
+        this._singleBounce = false;
         try {
             global.compositor.enable_unredirect();
         } catch (e) {

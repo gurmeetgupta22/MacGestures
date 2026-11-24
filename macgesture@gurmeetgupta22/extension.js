@@ -31,6 +31,12 @@ export default class MacGestureExtension extends Extension {
                 onUpdate: progress => this._switcher.update(progress),
                 onEnd: (duration, endProgress) => this._switcher.end(duration, endProgress),
                 onCancel: () => this._switcher.cancel(),
+                canBounce: () => this._switcher.shouldBounce(),
+                onBeginBounce: () => this._switcher.beginBounce(),
+                onUpdateBounce: progress => this._switcher.updateBounce(progress),
+                onEndBounce: progress => this._switcher.endBounce(progress),
+                canRevealSingle: () => this._switcher.canRevealSingle(),
+                onRevealSingle: () => this._switcher.revealSingle(),
             },
             this._otherGestures
         );

@@ -68,6 +68,7 @@ const AppSwitchState = {
     PENDING: 1,
     HANDLING: 2,
     IGNORED: 3,
+    BOUNCING: 4,  // single non-minimized window: show bounce animation
 };
 
 // ── OtherGesture tracking ──────────────────────────────────────────────────────
@@ -680,7 +681,8 @@ export class GestureHandler {
     disable() {
         if (!this._enabled) return;
 
-        if (this._appSwitchState === AppSwitchState.HANDLING) {
+        if (this._appSwitchState === AppSwitchState.HANDLING ||
+            this._appSwitchState === AppSwitchState.BOUNCING) {
             try { this._callbacks.onCancel(); } catch (e) {
                 console.error('[MacGesture] cancel during disable failed:', e);
             }
@@ -825,6 +827,22 @@ export class GestureHandler {
                             } else {
                                 this._appSwitchState = AppSwitchState.IGNORED;
                             }
+                        } else if (this._callbacks.canBounce?.()) {
+                            // → Single non-minimized window: bounce animation
+                            if (this._other)
+                                this._other.reset();
+                            this._appSwitchState = AppSwitchState.BOUNCING;
+                            const distance = TOUCHPAD_BASE_WIDTH;
+                            const logicalDelta = this._logicalDelta(initDelta);
+                            this._progress = logicalDelta / distance;
+                            this._callbacks.onBeginBounce?.();
+                            this._callbacks.onUpdateBounce?.(this._progress);
+                        } else if (this._callbacks.canRevealSingle?.()) {
+                            // → Single minimized window: activate it immediately
+                            if (this._other)
+                                this._other.reset();
+                            this._appSwitchState = AppSwitchState.IGNORED;
+                            this._callbacks.onRevealSingle?.();
                         } else {
                             if (this._other)
                                 this._other.reset();
@@ -848,6 +866,31 @@ export class GestureHandler {
                 this._resetAppSwitch();
                 return Clutter.EVENT_STOP;
             }
+        }
+
+        // ── BOUNCING: single non-minimized window elastic resistance ─────────
+        if (this._appSwitchState === AppSwitchState.BOUNCING) {
+            const distance = TOUCHPAD_BASE_WIDTH;
+            const delta = this._logicalDelta(dx);
+
+            switch (phase) {
+            case Clutter.TouchpadGesturePhase.BEGIN:
+            case Clutter.TouchpadGesturePhase.UPDATE:
+                this._progress += delta / distance;
+                this._callbacks.onUpdateBounce?.(this._progress);
+                break;
+
+            case Clutter.TouchpadGesturePhase.END:
+            case Clutter.TouchpadGesturePhase.CANCEL: {
+                const currentProgress = this._progress;
+                const cb = this._callbacks;
+                this._resetAppSwitch();
+                cb.onEndBounce?.(currentProgress);
+                return Clutter.EVENT_STOP;
+            }
+            }
+
+            return Clutter.EVENT_STOP;
         }
 
         // ── HANDLING: app-switch overlay ──────────────────────────────────────
